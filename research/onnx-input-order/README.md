@@ -45,14 +45,16 @@ the 3 inputs run and produce **bit-identical outputs** on the CPU EP. The claim 
 the code comment ("purely cosmetic for backends that bind inputs by name") holds
 — for the CPU EP.
 
-### 3. Older OpenVINO EP has no such bug
+### 3. Official release line (ORT 1.24.1 + OpenVINO 2025.4) has no such bug
 
 With `onnxruntime-openvino 1.24.1` + OpenVINO `2025.4.1` (DLL path on PATH, GPU),
 `permute_and_run.py` reports **all 6 permutations run fine and give identical
 outputs** (`compare_ep.py` confirms the OpenVINO EP really ran on GPU, not a CPU
-fallback). The input-binding bug does not exist in the 2025.4 EP.
+fallback). The input-binding bug does not reproduce on this official-release
+stack. Note both ORT and OpenVINO versions differ from the dev build below, so the
+regression cannot be pinned to either component alone.
 
-### 4. On KataGo's real ORT 1.29.0 + OpenVINO 2026.2 stack, the failure depends on the branch
+### 4. On KataGo's self-built dev ORT 1.29.0 + OpenVINO 2026.2 stack, the failure depends on the branch
 
 Reproduced by temporarily gating the workaround with an env var
 (`KATAGO_DEBUG_MASTER_INPUT_ORDER=1` forces the master order; one-line change in
@@ -75,10 +77,38 @@ master order working there is *correct*, not "runs but wrong".
 - It is **fragile in exactly the way the review warned**: the EP's accepted input
   order is not the graph's first-reference order, is not derivable from the code,
   and *differs between branches* (master order crashes only on `=true`).
-- The failure is **new to the 2026.2 OpenVINO EP**: the 2025.4 EP binds inputs
-  correctly for all 6 orders. KataGo feeds inputs by name (ORT Run API), so the
-  mismatch is inside the EP, consistent with an interface violation on the vendor's
-  side.
+- The failure reproduces on the self-built dev ORT (1.29.0) + OpenVINO 2026.2
+  stack but **not** on the official release line (ORT 1.24.1 + OpenVINO 2025.4),
+  where all 6 orders work. The two stacks differ in *both* ORT and OpenVINO
+  versions, so the regression cannot be attributed to either version alone.
+  KataGo feeds inputs by name (ORT Run API), so the mismatch is inside the EP —
+  see the source-level root cause below.
+
+## Root cause (ORT source)
+
+The ONNX Runtime KataGo links is a **self-built dev build** (`onnxruntime` main
+branch, HEAD at local tag `test-tag-7528`, version string 1.29.0) — not an
+official release.
+
+The misrouting lives in the OpenVINO EP's input binding:
+
+- `basic_backend.h:135` pairs ORT inputs with the OpenVINO compiled model's inputs:
+  `populate(network_inputs_, subgraph_context.input_names, exec_network.Get().inputs())`.
+  ORT inputs are stored as a `std::unordered_map` (name → ORT index,
+  `contexts.h:122`) and aligned with the OpenVINO side **by name**.
+- At inference time (`basic_backend.cc:363`, static-shape path) the data is
+  **fetched by ORT index** but **bound by name**:
+  ```cpp
+  infer_request->SetTensor(input_info.name, input_info.type, input_info.shape,
+                           context.GetInput(input_info.onnx_index).GetTensorRawData());
+  ```
+  When the ONNX declaration order disagrees with the OpenVINO side's input
+  order/set — e.g. the dead `InputMask` in `requireExactNNLen=true` — the pair
+  misroutes the `[1,1,19,19]` mask tensor into the `InputSpatial` port, which is
+  the exact error reproduced in step 5.
+
+KataGo itself feeds inputs by name through the ORT Run API (the conforming
+interface); the mismatch is purely inside the EP's binding logic.
 
 ## Environment used
 
