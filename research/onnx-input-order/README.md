@@ -90,25 +90,61 @@ The ONNX Runtime KataGo links is a **self-built dev build** (`onnxruntime` main
 branch, HEAD at local tag `test-tag-7528`, version string 1.29.0) — not an
 official release.
 
-The misrouting lives in the OpenVINO EP's input binding:
+### Where the mis-indexing comes from
 
-- `basic_backend.h:135` pairs ORT inputs with the OpenVINO compiled model's inputs:
-  `populate(network_inputs_, subgraph_context.input_names, exec_network.Get().inputs())`.
-  ORT inputs are stored as a `std::unordered_map` (name → ORT index,
-  `contexts.h:122`) and aligned with the OpenVINO side **by name**.
-- At inference time (`basic_backend.cc:363`, static-shape path) the data is
-  **fetched by ORT index** but **bound by name**:
-  ```cpp
-  infer_request->SetTensor(input_info.name, input_info.type, input_info.shape,
-                           context.GetInput(input_info.onnx_index).GetTensorRawData());
-  ```
-  When the ONNX declaration order disagrees with the OpenVINO side's input
-  order/set — e.g. the dead `InputMask` in `requireExactNNLen=true` — the pair
-  misroutes the `[1,1,19,19]` mask tensor into the `InputSpatial` port, which is
-  the exact error reproduced in step 5.
+The regression is a 3-line change in the input-index loop of `backend_manager.cc`
+(executed when a subgraph is handed to the OpenVINO EP), introduced by commit
+`dfc27cd7c7e` "[OVEP] OpenVINO EP Features Release 1.23 (#25262)"
+(2025-07-04):
 
-KataGo itself feeds inputs by name through the ORT Run API (the conforming
-interface); the mismatch is purely inside the EP's binding logic.
+```cpp
+for (uint32_t index = 0; const auto& node : subgraph.GetInputs()) {
+  if (subgraph.GetGraph().GetConsumerNodes(node->Name()).size() == 0) {
+    continue;  // Skip if the input is a dangling node   <-- added by dfc27cd7c7e
+  }
+  subgraph_context_.input_names.insert({node->Name(), index++});
+}
+```
+
+`index` is documented as the position of a graph input **among the fused node's
+`inputDefs`** (which also contains initializers). Skipping a dangling input
+without skipping its `inputDefs` position desyncs `index` from the position that
+`context.GetInput(index)` later uses. At inference time (`basic_backend.cc:363`,
+static-shape path) the data is fetched **by ORT index** but bound **by name**:
+
+```cpp
+infer_request->SetTensor(input_info.name, input_info.type, input_info.shape,
+                         context.GetInput(input_info.onnx_index).GetTensorRawData());
+```
+
+When a dead input sits ahead of a live one in declaration order — e.g. the dead
+`InputMask` in `requireExactNNLen=true` — the live input gets a too-small index
+and the `[1,1,19,19]` mask tensor is routed into the `InputSpatial` port: the
+exact error reproduced in step 5. This also explains the workaround: declaring
+the dead `InputMask` last keeps the surviving indices contiguous.
+
+> **Confidence note:** this mechanism is an interpretation that matches every
+> observation (real-stack crash, `=false` branch working, workaround working),
+> but the "fused node `inputDefs`" semantics of `context.GetInput` has not been
+> verified directly (e.g. by reverting the 3 lines and re-testing).
+
+### When it was introduced
+
+| onnxruntime version | dangling-skip code present |
+|---|---|
+| v1.22.0 / v1.22.1 / v1.22.2 | no |
+| **v1.23.0** (first) … v1.24.x, v1.25.x, v1.26, v1.27, v1.28.0 | **yes** |
+| KataGo's self-built dev 1.29.0 | yes |
+
+The code exists in official ONNX Runtime from **v1.23.0** onwards (confirmed by
+`git show <tag>`). Note **"code present" ≠ "bug reproduces"**: whether it
+actually crashes also depends on how ORT/OpenVINO treat the dead input, which is
+why the official `onnxruntime-openvino 1.24.1` + OpenVINO 2025.4 stack (step 4)
+does not reproduce it. That difference is not yet explained and is out of scope
+for this repo.
+
+KataGo feeds inputs by name through the ORT Run API (the conforming interface);
+the mismatch is purely inside the EP's binding logic.
 
 ## Environment used
 
