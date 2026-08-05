@@ -178,6 +178,9 @@ jobs:
           # /usr/local/bin ahead of the bundled one.
           pip3 install cmake >/dev/null
           cmake --version | head -1
+          # The workspace is a docker mount owned by a different uid, so git refuses it
+          # ("dubious ownership") when KataGo regenerates gitinfo.h during the build.
+          git config --global --add safe.directory '*'
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" "https://github.com/${GITHUB_REPOSITORY}.git" .
 
       - name: Prepare ONNX Runtime (tensorrt)
