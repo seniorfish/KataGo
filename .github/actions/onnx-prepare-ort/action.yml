@@ -223,6 +223,8 @@ runs:
         # /usr/lib/x86_64-linux-gnu. The container ships cmake + python3; the workflow's
         # bootstrap step adds ninja. github-hosted runners have no GPU, so this verifies
         # build + EP wiring only - real GPU inference is validated on a GPU machine.
+        # Build only for sm_89 (RTX 4090): ORT's default 10-arch matrix is huge and slow
+        # on a no-GPU CI runner. Tune per the GPU you validate on.
         python3 tools/ci_build/build.py --build_dir build --config Release \
           --use_tensorrt --use_cuda \
           --cuda_home /usr/local/cuda \
@@ -230,7 +232,7 @@ runs:
           --tensorrt_home /usr/lib/x86_64-linux-gnu \
           --build_shared_lib --skip_tests --parallel \
           --cmake_generator Ninja --allow_running_as_root --skip_submodule_sync \
-          --cmake_extra_defines "CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/deps/install/ort"
+          --cmake_extra_defines "CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/deps/install/ort" "CMAKE_CUDA_ARCHITECTURES=89"
         cmake --install build/Release --config Release
 
     # NOTE: MIGraphX from-source build slots in here once validated (needs ROCm; deferred).
