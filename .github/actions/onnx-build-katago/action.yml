@@ -97,6 +97,9 @@ runs:
         # (deps/install/ort/lib), which no longer exists once the artifact is downloaded
         # elsewhere. Rewrite it to $ORIGIN so the binary finds the sibling
         # libonnxruntime.so* in the release dir, matching the Windows DLL convention.
-        if ! command -v patchelf >/dev/null 2>&1; then sudo apt-get install -y patchelf >/dev/null; fi
+        if ! command -v patchelf >/dev/null 2>&1; then
+          # Ubuntu runners have sudo; the NGC TensorRT container runs as root without it.
+          if command -v sudo >/dev/null 2>&1; then sudo apt-get install -y patchelf >/dev/null; else apt-get install -y patchelf >/dev/null; fi
+        fi
         patchelf --set-rpath '$ORIGIN' release/katago
         ls -la release

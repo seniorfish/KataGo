@@ -212,9 +212,28 @@ runs:
         cmake --install build\Release --config Release
         if errorlevel 1 exit /b 1
 
-    # NOTE: TensorRT / MIGraphX from-source builds slot in here once validated. They need
-    # CUDA+TensorRT SDK (ubuntu) / ROCm respectively, and github-hosted runners have no GPU,
-    # so each should be smoke-validated on a GPU machine before being wired into the matrix.
+    - name: Build ONNX Runtime with TensorRT EP (Linux container)
+      if: inputs.mode == 'from-source' && inputs.ep == 'tensorrt' && runner.os == 'Linux' && steps.cache-ort.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: deps/onnxruntime
+      run: |
+        # Runs inside the official NGC TensorRT container
+        # (nvcr.io/nvidia/tensorrt:25.03-py3 = CUDA 12.8 + TensorRT 10.9, the combo ORT is
+        # tested against), which preinstalls CUDA/cuDNN/TensorRT under /usr/local/cuda and
+        # /usr/lib/x86_64-linux-gnu. The container ships cmake + python3; the workflow's
+        # bootstrap step adds ninja. github-hosted runners have no GPU, so this verifies
+        # build + EP wiring only - real GPU inference is validated on a GPU machine.
+        python3 tools/ci_build/build.py --build_dir build --config Release \
+          --use_tensorrt --use_cuda \
+          --cuda_home /usr/local/cuda \
+          --cudnn_home /usr/lib/x86_64-linux-gnu \
+          --tensorrt_home /usr/lib/x86_64-linux-gnu \
+          --build_shared_lib --skip_tests --parallel \
+          --cmake_generator Ninja --allow_running_as_root --skip_submodule_sync \
+          --cmake_extra_defines "CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/deps/install/ort"
+        cmake --install build/Release --config Release
+
+    # NOTE: MIGraphX from-source build slots in here once validated (needs ROCm; deferred).
 
     - name: Report ORT install tree
       shell: bash
