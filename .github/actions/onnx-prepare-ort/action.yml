@@ -237,6 +237,26 @@ runs:
 
     # NOTE: MIGraphX from-source build slots in here once validated (needs ROCm; deferred).
 
+    # Save caches explicitly: actions/cache@v4's post-save does not reliably run inside
+    # composite actions, so without these every run would rebuild zlib/protobuf and ORT.
+    # Only save when this run actually built the dep (restore cache-missed); the key must
+    # match the restore key above.
+    - name: Save common-dep cache
+      if: steps.cache-common.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          deps/install/zlib
+          deps/install/protobuf
+        key: onnx-common-${{ runner.os }}-pb-${{ inputs.pb_version }}-zl-${{ inputs.zlib_version }}
+
+    - name: Save ORT cache
+      if: steps.cache-ort.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: deps/install/ort
+        key: onnx-ort-${{ runner.os }}-${{ inputs.ep }}-${{ inputs.ort_version }}-${{ inputs.ort_ref }}
+
     - name: Report ORT install tree
       shell: bash
       run: |
