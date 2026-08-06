@@ -297,6 +297,13 @@ class RingOutBuf : public std::streambuf {
 
  private:
   void flushLine() {
+    // overflow() appends the '\n' to line_ before calling this, and
+    // writeOutputBytes() appends its own trailing '\n'. Strip the newline so
+    // each line is emitted exactly once - otherwise every line is written as
+    // "line\n\n" and the extra blank lines terminate GTP responses early,
+    // truncating multi-line responses (showboard, list_commands, ...).
+    if(!line_.empty() && line_.back() == '\n')
+      line_.pop_back();
     writeOutputLine(line_);
     line_.clear();
   }
@@ -310,7 +317,11 @@ void installIO() {
   ensureInit();
   static RingOutBuf s_outBuf;
   std::cout.rdbuf(&s_outBuf);
-  std::cerr.rdbuf(&s_outBuf);
+  // stderr is deliberately NOT redirected: katago's logger writes diagnostics
+  // to stderr, and interleaving them with GTP responses on the output ring
+  // would corrupt the JS-side response parsing (a logger line can land inside
+  // a multi-line response). stderr stays on the default emscripten path, which
+  // surfaces in the browser console.
 }
 
 }  // namespace WasmBridge
