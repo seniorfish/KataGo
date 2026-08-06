@@ -391,10 +391,13 @@ if(EMSCRIPTEN)
     "-sPROXY_TO_PTHREAD=1"
     "-sPTHREAD_POOL_SIZE=16"
     "-sSHARED_MEMORY=1"
-    # Fixed 512MB heap, no growth: the zero-copy bridge relies on "engine heap = SAB with
-    # stable addresses".
-    "-sINITIAL_MEMORY=536870912"
-    "-sMAXIMUM_MEMORY=536870912"
+    # Fixed 1.5GB heap, no growth: the zero-copy bridge relies on "engine heap = SAB with stable
+    # addresses". Loading a typical transformer .bin.gz transiently holds the compressed blob,
+    # its decompressed copy, the ModelDesc weights, AND the built ONNX proto/output at various
+    # stages (a .bin.gz load alone can exceed 1GB for b11c768); 1.5GB keeps the load + build peaks
+    # comfortably inside the fixed heap.
+    "-sINITIAL_MEMORY=1610612736"
+    "-sMAXIMUM_MEMORY=1610612736"
     "-sMODULARIZE=1"
     "-sEXPORT_NAME=createKataGoModule"
     "-sEXPORTED_FUNCTIONS=_getBridgeOffsets,_malloc,_free,__emscripten_proxy_main"
@@ -575,8 +578,10 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
 elseif(USE_BACKEND STREQUAL "ONNX")
   target_compile_definitions(katago PRIVATE USE_ONNX_BACKEND)
 
-  # WASM does not link ORT/protobuf: inference goes to onnxruntime-web (JS side) via the
-  # __EMSCRIPTEN__ branch in onnxbackend.cpp (WasmBridge).
+  # Native: link the ONNX Runtime C++ API and protobuf. WASM does NOT link ORT (inference goes
+  # to onnxruntime-web on the JS side via the __EMSCRIPTEN__ branch in onnxbackend.cpp), but it
+  # DOES link protobuf - the engine builds the ONNX graph itself via OnnxModelBuilder. See the
+  # else() branch below.
   if(NOT EMSCRIPTEN)
 
   # ONNX Runtime install tree (include/ lib/ bin/). The official prebuilt ORT packages do
@@ -646,7 +651,42 @@ elseif(USE_BACKEND STREQUAL "ONNX")
     endforeach()
   endif()
 
-  endif()  # if(NOT EMSCRIPTEN)
+  else()  # EMSCRIPTEN
+    # WASM: the engine builds the ONNX graph at runtime (OnnxModelBuilder, same as native) and
+    # hands the serialized bytes to onnxruntime-web over the shared-memory bridge, so it links
+    # protobuf but NOT the ONNX Runtime C++ API. libprotobuf.a is the emcc-compiled static
+    # library produced by cpp/wasm/build_wasm_protobuf; onnx.pb.cc/h is generated here with a
+    # native (host) protoc so the generated code matches the libprotobuf version exactly.
+    set(ONNX_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/onnx")
+
+    set(KATAGO_WASM_PROTOBUF_ROOT "" CACHE PATH
+      "Root of the emcc-compiled protobuf install (containing include/ and lib/libprotobuf.a). Built by cpp/wasm/build_wasm_protobuf.")
+    set(KATAGO_WASM_PROTOC "" CACHE FILEPATH
+      "Path to a native (host) protoc whose version matches KATAGO_WASM_PROTOBUF_ROOT's libprotobuf. Set by cpp/wasm/build_wasm_protobuf.")
+    if(NOT IS_DIRECTORY "${KATAGO_WASM_PROTOBUF_ROOT}/include" OR NOT EXISTS "${KATAGO_WASM_PROTOBUF_ROOT}/lib/libprotobuf.a")
+      message(FATAL_ERROR "KATAGO_WASM_PROTOBUF_ROOT does not contain a protobuf install (include/ + lib/libprotobuf.a): ${KATAGO_WASM_PROTOBUF_ROOT}")
+    endif()
+    if(NOT EXISTS "${KATAGO_WASM_PROTOC}")
+      message(FATAL_ERROR "KATAGO_WASM_PROTOC does not exist: ${KATAGO_WASM_PROTOC}")
+    endif()
+
+    execute_process(
+      # NOTE: no literal quotes around the arguments - CMake's execute_process adds its own
+      # quoting for arguments containing spaces. Literal quotes here are passed through to
+      # protoc and break the paths.
+      COMMAND ${KATAGO_WASM_PROTOC} --proto_path=${ONNX_PROTO_DIR} --cpp_out=${CMAKE_CURRENT_BINARY_DIR} ${ONNX_PROTO_DIR}/onnx.proto
+      RESULT_VARIABLE _wasm_protoc_result
+      OUTPUT_VARIABLE _wasm_protoc_stdout
+      ERROR_VARIABLE _wasm_protoc_stderr
+    )
+    if(NOT _wasm_protoc_result EQUAL 0)
+      message(FATAL_ERROR "Failed to generate onnx.pb.cc/h with ${KATAGO_WASM_PROTOC}:\n${_wasm_protoc_stderr}")
+    endif()
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/onnx.pb.cc" PROPERTIES COMPILE_OPTIONS "-w")
+    target_sources(katago PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/onnx.pb.cc" neuralnet/onnxmodelbuilder.cpp)
+    target_include_directories(katago SYSTEM PRIVATE "${KATAGO_WASM_PROTOBUF_ROOT}/include" "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(katago "${KATAGO_WASM_PROTOBUF_ROOT}/lib/libprotobuf.a")
+  endif()  # if(NOT EMSCRIPTEN) / else()
 endif()
 
 if(USE_BIGGER_BOARDS_EXPENSIVE)

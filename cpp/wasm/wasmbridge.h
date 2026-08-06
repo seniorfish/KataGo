@@ -47,6 +47,14 @@ struct BridgeCtrl {
   int32_t outPolicyPassOff, outPolicyOff, outValueOff, outScoreOff, outOwnOff;
   int32_t outPolicyPassElts, outPolicyElts, outValueElts, outScoreElts, outOwnElts;
   int32_t metaHasData;
+  // ONNX model upload (engine -> JS): the engine builds the ONNX graph at runtime and hands
+  // the serialized bytes to the JS inference worker. Monotonic request/ack counters (immune to
+  // missed/spurious wakeups) plus the byte offset/length of the payload in the wasm heap. The
+  // payload stays owned by the engine until the JS side acks (i.e. has consumed it).
+  int32_t onnxReq;
+  int32_t onnxAck;
+  int32_t onnxOff;
+  int32_t onnxLen;
 };
 
 // Lazy initialization: allocates the ctrl struct + rings. Thread-safe (guarded by a once flag).
@@ -90,6 +98,12 @@ int outputRegionElts(int region);
 
 // Triggers one inference and blocks for the result (the NN worker runs the Atomics protocol).
 void runInference(int batchSize);
+
+// Hands a serialized ONNX ModelProto (built by OnnxModelBuilder at runtime) to the JS inference
+// worker. Blocks until the worker has consumed the bytes (created its session) or a timeout
+// elapses (so a crashed worker fails loudly instead of deadlocking the engine). The caller must
+// keep `data` alive for the whole call; it is freed after this returns.
+void sendOnnxModel(const char* data, size_t len);
 
 }  // namespace WasmBridge
 

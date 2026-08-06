@@ -44,12 +44,12 @@
 
 #ifdef __EMSCRIPTEN__
 #include "../wasm/wasmbridge.h"
-#include "../external/nlohmann_json/json.hpp"
 #endif
 
 #include <unordered_map>
 #include <fstream>
 #include <cstdlib>
+#include <cstdio>  // std::remove (WASM: free the uploaded model file after parsing)
 #include <cstring>
 #include <mutex>
 
@@ -67,51 +67,6 @@ static const char* const kKnownProviders[] = {
 
 //--------------------------------------------------------------
 
-#ifdef __EMSCRIPTEN__
-// Populates ModelDesc metadata from an offline-generated model.meta.json
-// (holding only the scalar ModelDesc fields). Weights/trunk/heads are left empty: the engine
-// does not parse weights under WASM, and numeric post-processing only depends on these scalars.
-static void loadModelDescFromJSON(const string& fileName, ModelDesc& m) {
-  std::ifstream in(fileName);
-  if(!in)
-    throw StringError("ONNX backend (WASM): cannot open model meta file: " + fileName);
-  nlohmann::json j;
-  try {
-    in >> j;
-  }
-  catch(...) {
-    throw StringError("ONNX backend (WASM): failed to parse model meta file: " + fileName);
-  }
-
-  m.name = j.value("name", string());
-  m.modelVersion = j.value("modelVersion", -1);
-  m.numInputChannels = j.value("numInputChannels", 0);
-  m.numInputGlobalChannels = j.value("numInputGlobalChannels", 0);
-  m.numInputMetaChannels = j.value("numInputMetaChannels", 0);
-  m.numPolicyChannels = j.value("numPolicyChannels", 0);
-  m.numValueChannels = j.value("numValueChannels", 0);
-  m.numScoreValueChannels = j.value("numScoreValueChannels", 0);
-  m.numOwnershipChannels = j.value("numOwnershipChannels", 0);
-  m.metaEncoderVersion = j.value("metaEncoderVersion", 0);
-  m.preferPassAliveUnderSuicideRules = j.value("preferPassAliveUnderSuicideRules", false);
-
-  const auto& pp = j.value("postProcessParams", nlohmann::json::object());
-  ModelPostProcessParams p;
-  p.tdScoreMultiplier = pp.value("tdScoreMultiplier", 1.0);
-  p.scoreMeanMultiplier = pp.value("scoreMeanMultiplier", 1.0);
-  p.scoreStdevMultiplier = pp.value("scoreStdevMultiplier", 1.0);
-  p.leadMultiplier = pp.value("leadMultiplier", 1.0);
-  p.varianceTimeMultiplier = pp.value("varianceTimeMultiplier", 1.0);
-  p.shorttermValueErrorMultiplier = pp.value("shorttermValueErrorMultiplier", 1.0);
-  p.shorttermScoreErrorMultiplier = pp.value("shorttermScoreErrorMultiplier", 1.0);
-  p.outputScaleMultiplier = pp.value("outputScaleMultiplier", 1.0);
-  m.postProcessParams = p;
-
-  if(m.modelVersion < 0 || m.numInputChannels <= 0 || m.numPolicyChannels <= 0)
-    throw StringError("ONNX backend (WASM): model meta file has missing/invalid fields: " + fileName);
-}
-#endif  // __EMSCRIPTEN__
-
 //--------------------------------------------------------------
 
 struct LoadedModel {
@@ -125,6 +80,19 @@ struct LoadedModel {
   // each thread runs maybeApplyScale8 (under the lock) before building its graph.
   mutable bool scale8Resolved;
   mutable std::mutex scale8Mutex;
+#ifdef __EMSCRIPTEN__
+  // Every NN server thread creates its own ComputeHandle; the ONNX graph must be built and
+  // handed to the JS side exactly once (see ComputeHandle's WASM branch).
+  mutable std::once_flag onnxBuiltFlag;
+
+  // WASM: the ONNX graph built by OnnxModelBuilder holds its own weight copies, so after the
+  // build the ModelDesc weights are no longer needed. Release them to keep the fixed-size heap
+  // free for the search tree. The caller must ensure no other thread reads the weights
+  // afterwards (under WASM the build runs exactly once, before any inference).
+  void releaseWeightsAfterOnnxBuild() const {
+    const_cast<ModelDesc&>(modelDesc).releaseWeights();
+  }
+#endif
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
     if(Global::isSuffix(fileName, ".onnx"))
@@ -132,13 +100,13 @@ struct LoadedModel {
         "ONNX backend: loading a raw .onnx file is not supported by this backend. "
         "Feed a standard KataGo .bin.gz model instead (this backend builds the ONNX "
         "graph from the model weights internally).");
-#ifdef __EMSCRIPTEN__
-    // The WASM engine does not load model weights (those live on the onnxruntime-web side);
-    // it only reads the ModelDesc scalars from the offline-generated model.meta.json for
-    // input/output buffer sizing and post-processing.
-    loadModelDescFromJSON(fileName, modelDesc);
-#else
+    // Same parse as every other backend: full ModelDesc, weights included. Under WASM the
+    // ONNX graph is built from these weights at runtime (see ComputeHandle's WASM branch).
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
+#ifdef __EMSCRIPTEN__
+    // Free the model file from the virtual filesystem: the weights are now in memory, and a
+    // ~200MB+ compressed blob must not stay resident in the fixed-size wasm heap.
+    std::remove(fileName.c_str());
 #endif
     scale8Resolved = false;
   }
@@ -405,9 +373,29 @@ struct ComputeHandle {
       numOwnershipChannels(loadedModel.modelDesc.numOwnershipChannels)
   {
 #ifdef __EMSCRIPTEN__
-    // WASM: inference is handled by onnxruntime-web (a JS-side NN worker); here we only
-    // allocate the pinned input/output regions, sized to the configured max batch so that
-    // the pinned region never overflows the engine's actual batching.
+    // WASM: inference runs on onnxruntime-web (a JS-side worker). The ONNX graph is built here
+    // at runtime from the full model weights via the same OnnxModelBuilder as every other
+    // backend, exactly once, and handed to the JS worker over the shared-memory bridge.
+    std::call_once(loadedModel.onnxBuiltFlag, [&]() {
+      if(logger != NULL)
+        logger->write("ONNX backend (WASM): building ONNX graph from model weights...");
+      OnnxModelBuilder::Result onnxResult = OnnxModelBuilder::build(
+        loadedModel.modelDesc, ctx->nnXLen, ctx->nnYLen, requireExactNNLen, ctx->transformerNHWC, logger);
+      if(logger != NULL)
+        logger->write("ONNX backend (WASM): ONNX graph built ("
+          + Global::uint64ToString(onnxResult.serializedModel.size())
+          + " bytes), handing off to the JS side...");
+      // Blocks until the JS worker has consumed the bytes (created its session). The payload
+      // must stay alive for the whole call; onnxResult is destroyed when this lambda returns.
+      WasmBridge::sendOnnxModel(onnxResult.serializedModel.data(), onnxResult.serializedModel.size());
+      // The handoff succeeded and the serialized ONNX holds its own weight copies. Drop the
+      // ModelDesc weights so they don't stay resident in the fixed-size heap for the rest of
+      // the session. (Released only after a successful handoff, so any earlier failure leaves
+      // build() pure and the weights intact.)
+      loadedModel.releaseWeightsAfterOnnxBuild();
+    });
+    // Allocate the pinned input/output regions, sized to the configured max batch so that the
+    // pinned region never overflows the engine's actual batching.
     WasmBridge::setupInference(
       numInputChannels, numInputGlobalChannels, numInputMetaChannels,
       numPolicyChannels, numValueChannels, numScoreValueChannels, numOwnershipChannels,

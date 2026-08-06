@@ -3,6 +3,9 @@
 #ifdef __EMSCRIPTEN__
 
 #include <emscripten/threading_primitives.h>
+#include <emscripten/emscripten.h>  // emscripten_get_now (monotonic ms for the handoff timeout)
+
+#include "../core/global.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -239,6 +242,33 @@ void runInference(int batchSize) {
     if(emscripten_atomic_load_u32(&ctrl->shutdownFlag) != 0)
       return;
     emscripten_futex_wait(&ctrl->inferResp, emscripten_atomic_load_u32(&ctrl->inferResp), INFINITY);
+  }
+}
+
+void sendOnnxModel(const char* data, size_t len) {
+  if(len > INT32_MAX)
+    throw StringError("WASM bridge: ONNX model too large to hand off over the shared-memory bridge");
+  BridgeCtrl* ctrl = ensureCtrl();
+  emscripten_atomic_store_u32(&ctrl->onnxOff, static_cast<int32_t>(reinterpret_cast<intptr_t>(data)));
+  emscripten_atomic_store_u32(&ctrl->onnxLen, static_cast<int32_t>(len));
+  const uint32_t req = emscripten_atomic_load_u32(&ctrl->onnxReq) + 1;
+  emscripten_atomic_store_u32(&ctrl->onnxReq, req);
+  emscripten_futex_wake(&ctrl->onnxReq, 1);
+
+  // Block until the JS inference worker has consumed the bytes (created its session), with a
+  // hard deadline so a crashed worker fails loudly instead of deadlocking the engine for good.
+  // Creating a session from a ~hundreds-of-MB model can legitimately take minutes.
+  const double kTimeoutMs = 10.0 * 60.0 * 1000.0;
+  const double startMs = emscripten_get_now();
+  while(emscripten_atomic_load_u32(&ctrl->onnxAck) < req) {
+    if(emscripten_atomic_load_u32(&ctrl->shutdownFlag) != 0)
+      return;
+    const double elapsedMs = emscripten_get_now() - startMs;
+    if(elapsedMs >= kTimeoutMs)
+      throw StringError(
+        "WASM bridge: timed out waiting for the JS side to load the ONNX model ("
+        + Global::intToString((int)(elapsedMs / 1000.0)) + " s elapsed)");
+    emscripten_futex_wait(&ctrl->onnxAck, emscripten_atomic_load_u32(&ctrl->onnxAck), kTimeoutMs - elapsedMs);
   }
 }
 
