@@ -375,6 +375,38 @@ add_executable(katago
   main.cpp
   )
 
+if(EMSCRIPTEN)
+  # ---- WebAssembly (Emscripten) specific configuration ----
+  # The bridge routes GTP I/O and NN inference over shared-memory rings (the wasm heap IS a
+  # SharedArrayBuffer); ORT/protobuf are NOT linked. stdin/stdout are forwarded by WasmBridge.
+  message(STATUS "Building for WebAssembly with WASM bridge (USE_EMSCRIPTEN_WASM).")
+  target_compile_definitions(katago PRIVATE USE_EMSCRIPTEN_WASM)
+  # wasm32 is little-endian; numpywrite.cpp relies on system headers for BYTE_ORDER, which
+  # Emscripten's libc does not define.
+  target_compile_definitions(katago PRIVATE BYTE_ORDER=1234 LITTLE_ENDIAN=1234 BIG_ENDIAN=4321)
+  target_sources(katago PRIVATE wasm/wasmbridge.cpp)
+  target_compile_options(katago PRIVATE "-pthread" "-msimd128" "-sUSE_ZLIB=1" "-fwasm-exceptions")
+  target_link_options(katago PRIVATE
+    "-pthread"
+    "-sPROXY_TO_PTHREAD=1"
+    "-sPTHREAD_POOL_SIZE=16"
+    "-sSHARED_MEMORY=1"
+    # Fixed 512MB heap, no growth: the zero-copy bridge relies on "engine heap = SAB with
+    # stable addresses".
+    "-sINITIAL_MEMORY=536870912"
+    "-sMAXIMUM_MEMORY=536870912"
+    "-sMODULARIZE=1"
+    "-sEXPORT_NAME=createKataGoModule"
+    "-sEXPORTED_FUNCTIONS=_getBridgeOffsets,_malloc,_free,__emscripten_proxy_main"
+    "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,callMain,HEAPU8,HEAP32,HEAPF32,UTF8ToString,stringToUTF8,lengthBytesUTF8,FS,getValue,setValue"
+    "-sSTACK_SIZE=1048576"
+    "-sDEFAULT_PTHREAD_STACK_SIZE=2097152"
+    "-sFILESYSTEM=1"
+    "-sUSE_ZLIB=1"
+    "-fwasm-exceptions"
+  )
+endif()
+
 if(USE_BACKEND STREQUAL "CUDA")
   target_compile_definitions(katago PRIVATE USE_CUDA_BACKEND)
   target_compile_definitions(katago PRIVATE CUDA_TARGET_VERSION=${CMAKE_CUDA_COMPILER_VERSION})
@@ -543,6 +575,10 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
 elseif(USE_BACKEND STREQUAL "ONNX")
   target_compile_definitions(katago PRIVATE USE_ONNX_BACKEND)
 
+  # WASM does not link ORT/protobuf: inference goes to onnxruntime-web (JS side) via the
+  # __EMSCRIPTEN__ branch in onnxbackend.cpp (WasmBridge).
+  if(NOT EMSCRIPTEN)
+
   # ONNX Runtime install tree (include/ lib/ bin/). The official prebuilt ORT packages do
   # NOT ship the OpenVINO execution provider, so for Intel GPU acceleration ORT must be
   # built from source with --use_openvino GPU (see the project's build notes).
@@ -609,6 +645,8 @@ elseif(USE_BACKEND STREQUAL "ONNX")
           $<TARGET_FILE_DIR:katago>)
     endforeach()
   endif()
+
+  endif()  # if(NOT EMSCRIPTEN)
 endif()
 
 if(USE_BIGGER_BOARDS_EXPENSIVE)
@@ -619,6 +657,10 @@ if(NO_GIT_REVISION AND (NOT BUILD_DISTRIBUTED))
   target_compile_definitions(katago PRIVATE NO_GIT_REVISION)
 endif()
 
+if(EMSCRIPTEN)
+  # Emscripten's zlib port: -sUSE_ZLIB=1 (headers + libz.a) was added in the EMSCRIPTEN block above.
+  message(STATUS "zlib: using Emscripten port (-sUSE_ZLIB=1).")
+else()
 find_package(ZLIB)
 if(ZLIB_FOUND)
   include_directories(${ZLIB_INCLUDE_DIRS})
@@ -629,6 +671,7 @@ else()
   mark_as_advanced(CLEAR ZLIB_INCLUDE_DIR ZLIB_LIBRARY)
   message(SEND_ERROR "${ColorBoldRed}zlib was not found, if zlib is actually installed but not being found you can set ZLIB_INCLUDE_DIR to the directory with zlib.h and other headers, and ZLIB_LIBRARY to the compiled library 'libz.so' on Linux or 'libz.lib' on Windows. On the command line, this is -DZLIB_INCLUDE_DIR=... and -DZLIB_LIBRARY=... ${ColorReset}")
 endif(ZLIB_FOUND)
+endif()
 
 find_library(LIBZIP_LIBRARY NAMES zip)
 find_path(LIBZIP_INCLUDE_DIR_ZIP NAMES zip.h)
@@ -725,20 +768,27 @@ if(MSVC)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   message(STATUS "Setting up build for GNU, Clang or MinGW.")
-  if(NOT (${CMAKE_SYSTEM_PROCESSOR} MATCHES "(arm|aarch32|aarch64)"))
-    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -mfpmath=sse")
-  else()
-    # For ARM architecture, as a hack, ensure that char is signed
-    message(STATUS "ARM architecture detected: adding -fsigned-char flag")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsigned-char")
+  if(NOT EMSCRIPTEN)
+    if(NOT (${CMAKE_SYSTEM_PROCESSOR} MATCHES "(arm|aarch32|aarch64)"))
+      set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -mfpmath=sse")
+    else()
+      # For ARM architecture, as a hack, ensure that char is signed
+      message(STATUS "ARM architecture detected: adding -fsigned-char flag")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsigned-char")
+    endif()
   endif()
   if(USE_AVX2)
     set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -mavx2 -mfma")
     target_compile_definitions(katago PRIVATE USE_AVX2)
   endif()
 
-  find_package (Threads REQUIRED)
-  target_link_libraries(katago Threads::Threads)
+  if(EMSCRIPTEN)
+    # std::thread is provided by -pthread (compile/link flags added in the EMSCRIPTEN block).
+    message(STATUS "Threads: using Emscripten pthreads.")
+  else()
+    find_package (Threads REQUIRED)
+    target_link_libraries(katago Threads::Threads)
+  endif()
 
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -Wall -Wextra -Wno-sign-compare -Wcast-align -Wcast-qual -Wctor-dtor-privacy -Wdisabled-optimization -Wformat=2 -Wmissing-declarations -Wmissing-include-dirs -Woverloaded-virtual -Wredundant-decls -Wshadow -Wstrict-overflow=1 -Wswitch-default -Wfloat-conversion -Wunused")
   set(CMAKE_CXX_FLAGS_DEBUG "-g3 -O0 -fno-omit-frame-pointer")
@@ -762,7 +812,10 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
   else()
     message(STATUS "Enabling Clang-specific build options.")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wnull-dereference -Wdangling-else")
-    target_link_libraries(katago "atomic")
+    if(NOT EMSCRIPTEN)
+      # wasm32's native atomic instructions need no libatomic
+      target_link_libraries(katago "atomic")
+    endif()
   endif()
 
   if(USE_TCMALLOC)

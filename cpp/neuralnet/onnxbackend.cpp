@@ -25,6 +25,7 @@
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/onnxmodelbuilder.h"
 
+#ifndef __EMSCRIPTEN__
 #include <onnxruntime_cxx_api.h>
 #ifdef __APPLE__
 #include <coreml_provider_factory.h>
@@ -39,10 +40,17 @@
 #define KATAGO_ONNX_HAS_DML_PROVIDER_FACTORY 1
 #endif
 #endif
+#endif  // !__EMSCRIPTEN__
+
+#ifdef __EMSCRIPTEN__
+#include "../wasm/wasmbridge.h"
+#include "../external/nlohmann_json/json.hpp"
+#endif
 
 #include <unordered_map>
 #include <fstream>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 using namespace std;
@@ -56,6 +64,53 @@ using namespace std;
 static const char* const kKnownProviders[] = {
   "cpu", "openvino", "cuda", "tensorrt", "migraphx", "coreml", "directml",
 };
+
+//--------------------------------------------------------------
+
+#ifdef __EMSCRIPTEN__
+// Populates ModelDesc metadata from an offline-generated model.meta.json
+// (holding only the scalar ModelDesc fields). Weights/trunk/heads are left empty: the engine
+// does not parse weights under WASM, and numeric post-processing only depends on these scalars.
+static void loadModelDescFromJSON(const string& fileName, ModelDesc& m) {
+  std::ifstream in(fileName);
+  if(!in)
+    throw StringError("ONNX backend (WASM): cannot open model meta file: " + fileName);
+  nlohmann::json j;
+  try {
+    in >> j;
+  }
+  catch(...) {
+    throw StringError("ONNX backend (WASM): failed to parse model meta file: " + fileName);
+  }
+
+  m.name = j.value("name", string());
+  m.modelVersion = j.value("modelVersion", -1);
+  m.numInputChannels = j.value("numInputChannels", 0);
+  m.numInputGlobalChannels = j.value("numInputGlobalChannels", 0);
+  m.numInputMetaChannels = j.value("numInputMetaChannels", 0);
+  m.numPolicyChannels = j.value("numPolicyChannels", 0);
+  m.numValueChannels = j.value("numValueChannels", 0);
+  m.numScoreValueChannels = j.value("numScoreValueChannels", 0);
+  m.numOwnershipChannels = j.value("numOwnershipChannels", 0);
+  m.metaEncoderVersion = j.value("metaEncoderVersion", 0);
+  m.preferPassAliveUnderSuicideRules = j.value("preferPassAliveUnderSuicideRules", false);
+
+  const auto& pp = j.value("postProcessParams", nlohmann::json::object());
+  ModelPostProcessParams p;
+  p.tdScoreMultiplier = pp.value("tdScoreMultiplier", 1.0);
+  p.scoreMeanMultiplier = pp.value("scoreMeanMultiplier", 1.0);
+  p.scoreStdevMultiplier = pp.value("scoreStdevMultiplier", 1.0);
+  p.leadMultiplier = pp.value("leadMultiplier", 1.0);
+  p.varianceTimeMultiplier = pp.value("varianceTimeMultiplier", 1.0);
+  p.shorttermValueErrorMultiplier = pp.value("shorttermValueErrorMultiplier", 1.0);
+  p.shorttermScoreErrorMultiplier = pp.value("shorttermScoreErrorMultiplier", 1.0);
+  p.outputScaleMultiplier = pp.value("outputScaleMultiplier", 1.0);
+  m.postProcessParams = p;
+
+  if(m.modelVersion < 0 || m.numInputChannels <= 0 || m.numPolicyChannels <= 0)
+    throw StringError("ONNX backend (WASM): model meta file has missing/invalid fields: " + fileName);
+}
+#endif  // __EMSCRIPTEN__
 
 //--------------------------------------------------------------
 
@@ -77,7 +132,14 @@ struct LoadedModel {
         "ONNX backend: loading a raw .onnx file is not supported by this backend. "
         "Feed a standard KataGo .bin.gz model instead (this backend builds the ONNX "
         "graph from the model weights internally).");
+#ifdef __EMSCRIPTEN__
+    // The WASM engine does not load model weights (those live on the onnxruntime-web side);
+    // it only reads the ModelDesc scalars from the offline-generated model.meta.json for
+    // input/output buffer sizing and post-processing.
+    loadModelDescFromJSON(fileName, modelDesc);
+#else
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
+#endif
     scale8Resolved = false;
   }
 
@@ -112,7 +174,9 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
 //--------------------------------------------------------------
 
 struct ComputeContext {
+#ifndef __EMSCRIPTEN__
   Ort::Env env;
+#endif
   int nnXLen;
   int nnYLen;
   string providerName;
@@ -136,8 +200,10 @@ struct ComputeContext {
   std::unordered_map<std::string, std::unordered_map<std::string, std::string>> deviceConfigOverrides;
 
   ComputeContext(int xLen, int yLen)
-    : env(ORT_LOGGING_LEVEL_WARNING, "KataGoOnnx"),
-      nnXLen(xLen),
+    : nnXLen(xLen),
+#ifndef __EMSCRIPTEN__
+      env(ORT_LOGGING_LEVEL_WARNING, "KataGoOnnx"),
+#endif
       nnYLen(yLen),
       providerName("cpu"),
       openvinoDeviceType("GPU"),
@@ -309,7 +375,9 @@ static std::string extractShortDeviceName(const std::string& deviceType) {
 
 struct ComputeHandle {
   ComputeContext* ctx;
+#ifndef __EMSCRIPTEN__
   std::unique_ptr<Ort::Session> session;
+#endif
   int modelVersion;
   int numInputChannels;
   int numInputGlobalChannels;
@@ -325,7 +393,7 @@ struct ComputeHandle {
   vector<const char*> inputNamePtrs;
   vector<const char*> outputNamePtrs;
 
-  ComputeHandle(ComputeContext* context, const LoadedModel& loadedModel, Logger* logger, int deviceIdxForThread, int serverThreadIdx, bool requireExactNNLen)
+  ComputeHandle(ComputeContext* context, const LoadedModel& loadedModel, Logger* logger, int maxBatchSize, int deviceIdxForThread, int serverThreadIdx, bool requireExactNNLen)
     : ctx(context),
       modelVersion(loadedModel.modelDesc.modelVersion),
       numInputChannels(loadedModel.modelDesc.numInputChannels),
@@ -336,6 +404,19 @@ struct ComputeHandle {
       numScoreValueChannels(loadedModel.modelDesc.numScoreValueChannels),
       numOwnershipChannels(loadedModel.modelDesc.numOwnershipChannels)
   {
+#ifdef __EMSCRIPTEN__
+    // WASM: inference is handled by onnxruntime-web (a JS-side NN worker); here we only
+    // allocate the pinned input/output regions, sized to the configured max batch so that
+    // the pinned region never overflows the engine's actual batching.
+    WasmBridge::setupInference(
+      numInputChannels, numInputGlobalChannels, numInputMetaChannels,
+      numPolicyChannels, numValueChannels, numScoreValueChannels, numOwnershipChannels,
+      ctx->nnXLen, ctx->nnYLen, maxBatchSize);
+    if(logger != NULL)
+      logger->write("ONNX backend (WASM): inference via onnxruntime-web bridge");
+    return;
+  }
+#else
     if(logger != NULL)
       logger->write("ONNX backend: building ONNX graph from model weights...");
 
@@ -581,6 +662,7 @@ struct ComputeHandle {
                      " outputs=" + Global::uint64ToString(numOutputs));
     }
   }
+#endif  // !__EMSCRIPTEN__
 
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
@@ -623,7 +705,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
                   ": provider=" + context->providerName + " deviceIdx=" + deviceInfo);
   }
 
-  return new ComputeHandle(context, *loadedModel, logger, gpuIdxForThisThread, serverThreadIdx, requireExactNNLen);
+  return new ComputeHandle(context, *loadedModel, logger, maxBatchSize, gpuIdxForThisThread, serverThreadIdx, requireExactNNLen);
 }
 
 void NeuralNet::freeComputeHandle(ComputeHandle* computeHandle) {
@@ -779,6 +861,7 @@ void NeuralNet::getOutput(
     }
   }
 
+#ifndef __EMSCRIPTEN__
   // Build Ort::Value views over the host buffers (CPU memory; the execution provider
   // copies to device internally and returns outputs in CPU memory).
   Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -867,6 +950,49 @@ void NeuralNet::getOutput(
   assert(valueData != nullptr);
   assert(scoreValueData != nullptr);
   assert(ownershipData != nullptr);
+#else
+  // WASM: inputs were written to inputBuffers by the fill loop above; copy them to the
+  // pinned region -> runInference (served by onnxruntime-web in the NN worker), then read
+  // the raw logits back from the pinned output regions.
+  for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+    std::memcpy(
+      WasmBridge::inputRegionPtr(WasmBridge::INPUT_SPATIAL) +
+        (size_t)nIdx * WasmBridge::inputRegionElts(WasmBridge::INPUT_SPATIAL),
+      inputBuffers->spatialInput.data() + (size_t)inputBuffers->singleInputElts * nIdx,
+      inputBuffers->singleInputElts * sizeof(float));
+    std::memcpy(
+      WasmBridge::inputRegionPtr(WasmBridge::INPUT_GLOBAL) +
+        (size_t)nIdx * WasmBridge::inputRegionElts(WasmBridge::INPUT_GLOBAL),
+      inputBuffers->globalInput.data() + (size_t)inputBuffers->singleInputGlobalElts * nIdx,
+      inputBuffers->singleInputGlobalElts * sizeof(float));
+    std::memcpy(
+      WasmBridge::inputRegionPtr(WasmBridge::INPUT_MASK) +
+        (size_t)nIdx * WasmBridge::inputRegionElts(WasmBridge::INPUT_MASK),
+      inputBuffers->maskInput.data() + (size_t)inputBuffers->singleMaskElts * nIdx,
+      inputBuffers->singleMaskElts * sizeof(float));
+    if(numMetaFeatures > 0) {
+      std::memcpy(
+        WasmBridge::inputRegionPtr(WasmBridge::INPUT_META) +
+          (size_t)nIdx * WasmBridge::inputRegionElts(WasmBridge::INPUT_META),
+        inputBuffers->metaInput.data() + (size_t)inputBuffers->singleInputMetaElts * nIdx,
+        inputBuffers->singleInputMetaElts * sizeof(float));
+    }
+  }
+
+  WasmBridge::runInference(batchSize);
+
+  const float* policyPassData = WasmBridge::outputRegionPtr(WasmBridge::OUT_POLICY_PASS);
+  const float* policyData = WasmBridge::outputRegionPtr(WasmBridge::OUT_POLICY);
+  const float* valueData = WasmBridge::outputRegionPtr(WasmBridge::OUT_VALUE);
+  const float* scoreValueData = WasmBridge::outputRegionPtr(WasmBridge::OUT_SCORE);
+  const float* ownershipData = WasmBridge::outputRegionPtr(WasmBridge::OUT_OWNERSHIP);
+
+  assert(policyPassData != nullptr);
+  assert(policyData != nullptr);
+  assert(valueData != nullptr);
+  assert(scoreValueData != nullptr);
+  assert(ownershipData != nullptr);
+#endif
   assert((int)outputs.size() == batchSize);
 
   const int numPolicyChannels = (int)inputBuffers->singlePolicyPassResultElts;

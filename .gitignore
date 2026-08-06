@@ -28,6 +28,16 @@ cpp/tests/scratch
 cpp/program/gitinfo.h
 
 cpp/tests/results/matchsgfs/games.sgfs
+
+# CMake build directories (native + Emscripten WASM)
+cpp/build/
+cpp/build-cpu/
+cpp/build-dml/
+cpp/build-wasm/
+cpp/build*/
+
+# Claude Code agent working directory
+.claude/
 cpp/tests/results/matchsgfs2/games.sgfs
 
 cpp/data/

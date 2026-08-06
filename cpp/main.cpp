@@ -15,6 +15,10 @@
 
 #include <sstream>
 
+#ifdef __EMSCRIPTEN__
+#include "wasm/wasmbridge.h"
+#endif
+
 //------------------------
 #include "core/using.h"
 //------------------------
@@ -193,6 +197,12 @@ int main(int argc, const char* const* argv) {
   vector<string> args = MainArgs::getCommandLineArgsUTF8(argc,argv);
   MainArgs::makeCoutAndCerrAcceptUTF8();
 
+#ifdef __EMSCRIPTEN__
+  // WASM has no terminal for stdout/stderr; redirect cout/cerr to the output ring, which
+  // the JS side forwards back to the UI.
+  WasmBridge::installIO();
+#endif
+
   if(args.size() < 2) {
     printHelp(args);
     return 0;
@@ -203,8 +213,8 @@ int main(int argc, const char* const* argv) {
     return 0;
   }
 
-#if defined(OS_IS_WINDOWS)
-  //On windows, uncaught exceptions reaching toplevel don't normally get printed out,
+#if defined(OS_IS_WINDOWS) || defined(__EMSCRIPTEN__)
+  //On windows / wasm, uncaught exceptions reaching toplevel don't normally get printed out,
   //so explicitly catch everything and print
   int result;
   try {

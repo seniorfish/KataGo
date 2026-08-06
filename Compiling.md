@@ -204,3 +204,31 @@ Status legend:
    * The `onnxruntime` shared library must be on your path or beside the executable.
    * When using the OpenVINO EP, also deploy the OpenVINO runtime DLLs beside the executable (`openvino.dll`, `openvino_intel_gpu_plugin.dll`, `tbb12.dll`, `cache.json`, etc.), or put them on the system path.
    * Configure the provider in `configs/gtp_example.cfg` via the `onnx*` keys, e.g. `onnxProvider=openvino` and `onnxOpenVINODeviceType=GPU`. See the ONNX settings block in `configs/gtp_example.cfg` for the full list.
+
+## WebAssembly (Emscripten) backend (experimental)
+The `ONNX` backend can also be compiled to **WebAssembly** with Emscripten and run entirely in a browser. The engine itself does **not** link ONNX Runtime: inference is handed to **onnxruntime-web** (the browser build of ORT) running in a separate Web Worker, over a zero-copy shared-memory bridge. This lets a full KataGo GTP engine (search + `kata-analyze` + etc.) run client-side with GPU acceleration (WebGPU EP).
+
+The bridge lives in `cpp/wasm/` (`wasmbridge.*`), enabled only under `__EMSCRIPTEN__`:
+
+- **GTP I/O** — `stdin/stdout` are redirected to a shared-memory ring buffer (`SharedArrayBuffer` + `Atomics`); the JS side drives commands and consumes the text stream. `main()` runs on a pthread (`PROXY_TO_PTHREAD`) so the browser thread stays responsive.
+- **NN inference** — the ONNX backend's `getOutput` copies its inputs into a pinned region of the wasm heap; a JS Web Worker (onnxruntime-web) watches a request counter, runs the model, and writes outputs back. The engine then runs its normal post-processing.
+- **Model** — the engine loads a small `model.meta.json` (generated offline from a `.bin.gz`, containing only the ModelDesc scalars) instead of the full weights. The `.onnx` model file is loaded by onnxruntime-web directly.
+
+### Requirements
+   * Everything KataGo normally needs (CMake, a C++17 compiler, zlib), plus the **Emscripten SDK** (`emsdk install latest && emsdk activate latest`, and `source emsdk_env.sh`).
+   * **No native ONNX Runtime library, protobuf, or libzip are needed to build the engine** — the WASM build links none of them (the `if(EMSCRIPTEN)` branch in `cpp/CMakeLists.txt` skips ORT/protobuf/libzip entirely). Inference at runtime is instead provided by **onnxruntime-web** (the browser build of ONNX Runtime) running in a separate Web Worker; see "Runtime / browser notes".
+   * zlib comes from Emscripten's port (`-sUSE_ZLIB=1`; fetched once from GitHub at build time).
+
+### Compile
+   ```
+   emcmake cmake -S KataGo/cpp -B KataGo/cpp/build-wasm \
+     -DUSE_BACKEND=ONNX -DCMAKE_BUILD_TYPE=Release -DNO_GIT_REVISION=1
+   cmake --build KataGo/cpp/build-wasm -j
+   ```
+   Produces `katago.js` (modularized, `createKataGoModule`) and `katago.wasm` in the build dir. Key link settings (see the `if(EMSCRIPTEN)` block in `cpp/CMakeLists.txt`): pthreads + `PROXY_TO_PTHREAD`, a fixed 512 MB heap (no growth — the zero-copy bridge relies on stable heap addresses), `-fwasm-exceptions`, and `-sMODULARIZE`.
+
+### Runtime / browser notes
+   * The page must be served with **cross-origin isolation** headers (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`) so `SharedArrayBuffer` and pthreads work.
+   * Requires a Chromium-based browser (WebGPU EP needs Chrome/Edge 113+; wasm-exceptions needs 95+).
+   * A browser-side frontend (in a separate project) spawns the engine worker and the onnxruntime-web worker, loads the model, and wires up GTP. The `.onnx` model is produced from a `.bin.gz` via KataGo's `KATAGO_DUMP_ONNX` environment variable; the engine's `model.meta.json` is a small JSON holding the ModelDesc scalars (channel counts, model version, post-processing params).
+   * Limitations: human-style models that require SGF metadata (`metaEncoderVersion > 0`) are **not** supported in the browser build (no `humanSLProfile`); the engine can deadlock if the onnxruntime-web worker dies mid-inference (no timeout yet).

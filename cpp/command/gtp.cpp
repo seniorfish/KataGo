@@ -16,6 +16,9 @@
 #include "../tests/tests.h"
 #include "../command/commandline.h"
 #include "../main.h"
+#ifdef __EMSCRIPTEN__
+#include "../wasm/wasmbridge.h"
+#endif
 
 using namespace std;
 
@@ -2222,7 +2225,11 @@ int MainCmds::gtp(const vector<string>& args) {
   bool currentlyGenmoving = false;
   bool currentlyAnalyzing = false;
   string line;
+#ifdef __EMSCRIPTEN__
+  while(WasmBridge::readGtpLine(line)) {
+#else
   while(getline(cin,line)) {
+#endif
     //Parse command, extracting out the command itself, the arguments, and any GTP id number for the command.
     string command;
     vector<string> pieces;
