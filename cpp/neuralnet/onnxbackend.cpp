@@ -23,6 +23,7 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/onnxmodelbuilder.h"
+#include "../core/timer.h"
 
 #include <onnxruntime_cxx_api.h>
 #ifdef __APPLE__
@@ -358,6 +359,9 @@ static std::string extractShortDeviceName(const std::string& deviceType) {
 struct ComputeHandle {
   ComputeContext* ctx;
   std::unique_ptr<Ort::Session> session;
+  // True when the OpenVINO EP runs this thread on the NPU (see getOutput: the NPU runs
+  // batch-1 forwards only, since the EP recompiles the whole graph per batch size there).
+  bool isNpu;
   int modelVersion;
   int numInputChannels;
   int numInputGlobalChannels;
@@ -373,8 +377,9 @@ struct ComputeHandle {
   vector<const char*> inputNamePtrs;
   vector<const char*> outputNamePtrs;
 
-  ComputeHandle(ComputeContext* context, const LoadedModel& loadedModel, Logger* logger, int deviceIdxForThread, int serverThreadIdx, bool requireExactNNLen)
+  ComputeHandle(ComputeContext* context, const LoadedModel& loadedModel, Logger* logger, int maxBatchSize, int deviceIdxForThread, int serverThreadIdx, bool requireExactNNLen)
     : ctx(context),
+      isNpu(false),
       modelVersion(loadedModel.modelDesc.modelVersion),
       numInputChannels(loadedModel.modelDesc.numInputChannels),
       numInputGlobalChannels(loadedModel.modelDesc.numInputGlobalChannels),
@@ -702,6 +707,97 @@ struct ComputeHandle {
       logger->write("ONNX backend: session created, inputs=" + Global::uint64ToString(numInputs) +
                      " outputs=" + Global::uint64ToString(numOutputs));
     }
+
+    // Classify the OpenVINO device for this thread. The EP forces static shapes on the NPU and
+    // recompiles the whole graph per batch size, so NPU threads get special handling in
+    // warmupOpenVINO and getOutput.
+    if(provider == "openvino") {
+      string threadDeviceType = ctx->openvinoDeviceType;
+      if(serverThreadIdx >= 0 && serverThreadIdx < (int)ctx->perThreadDeviceType.size())
+        threadDeviceType = ctx->perThreadDeviceType[serverThreadIdx];
+      isNpu = threadDeviceType.find("NPU") != string::npos;
+    }
+
+    // Precompile the batch sizes the search will use before anything is running.
+    //
+    // KataGo's search varies the NN batch size with the number of concurrently waiting
+    // evaluations, and the OpenVINO EP compiles device code per batch size on first use:
+    // the GPU plugin builds per-shape kernels (slow dynamic kernels cover the compile time),
+    // and on NPU the EP recompiles the whole graph per shape. Either way the first searches
+    // hit multi-second stalls, so trigger those compilations here instead.
+    if(provider == "openvino")
+      warmupOpenVINO(maxBatchSize, logger, serverThreadIdx);
+  }
+
+  void warmupOpenVINO(int maxBatchSize, Logger* logger, int serverThreadIdx) {
+    string threadDeviceType = ctx->openvinoDeviceType;
+    if(serverThreadIdx >= 0 && serverThreadIdx < (int)ctx->perThreadDeviceType.size())
+      threadDeviceType = ctx->perThreadDeviceType[serverThreadIdx];
+
+    // The NPU is a single-stream device, so only batch size 1 is ever used there, and it
+    // recompiles the whole graph per batch size - precompiling sizes that never occur would
+    // waste minutes of startup on large models. Other devices precompile up to 4 batch sizes,
+    // covering the search-thread counts that are practical for this backend.
+    int warmupMaxBatch = isNpu ? 1 : std::min(maxBatchSize, 4);
+    if(warmupMaxBatch <= 0)
+      return;
+
+    if(logger != NULL) {
+      string cacheInfo = ctx->openvinoCacheDir.empty()
+        ? "no cache_dir set, compiled graphs are not persisted across runs (set onnxOpenVINOCacheDir to skip recompiling on restart)"
+        : "cache_dir=" + ctx->openvinoCacheDir + ", compiled graphs are reused by later runs";
+      logger->write(
+        "ONNX backend: OpenVINO warmup for thread " + Global::intToString(serverThreadIdx) +
+        ": precompiling batch sizes 1.." + Global::intToString(warmupMaxBatch) +
+        " on device_type=" + threadDeviceType + " (" + cacheInfo + ")");
+    }
+
+    Ort::MemoryInfo warmupMemInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    for(int batchSize = 1; batchSize <= warmupMaxBatch; batchSize++) {
+      ClockTimer timer;
+      vector<Ort::Value> warmupInputs;
+      warmupInputs.reserve(inputNames.size());
+      // Keep the zeroed buffers alive for the duration of Run.
+      vector<vector<float>> warmupBuffers;
+      warmupBuffers.reserve(inputNames.size());
+      for(size_t i = 0; i < inputNames.size(); i++) {
+        Ort::TypeInfo typeInfo = session->GetInputTypeInfo(i);
+        Ort::ConstTensorTypeAndShapeInfo tensorInfo = typeInfo.GetTensorTypeAndShapeInfo();
+        if(tensorInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+          throw StringError(
+            "ONNX backend: OpenVINO warmup failed - graph input '" + inputNames[i] +
+            "' is not float32");
+        vector<int64_t> shape = tensorInfo.GetShape();
+        if(shape.empty() || (shape[0] > 0 && shape[0] != batchSize))
+          throw StringError(
+            "ONNX backend: OpenVINO warmup failed - graph input '" + inputNames[i] +
+            "' does not declare a dynamic batch dimension");
+        // KataGo graphs declare the first dimension as the dynamic batch.
+        shape[0] = batchSize;
+        int64_t numElts = 1;
+        for(int64_t d : shape) {
+          if(d <= 0)
+            throw StringError(
+              "ONNX backend: OpenVINO warmup failed - graph input '" + inputNames[i] +
+              "' has an unsupported dynamic dimension");
+          numElts *= d;
+        }
+        warmupBuffers.emplace_back((size_t)numElts, 0.0f);
+        warmupInputs.push_back(Ort::Value::CreateTensor<float>(
+          warmupMemInfo, warmupBuffers.back().data(), (size_t)numElts,
+          shape.data(), shape.size()));
+      }
+      // Outputs are discarded; the point of the forward is the compilation it triggers.
+      session->Run(
+        Ort::RunOptions{nullptr},
+        inputNamePtrs.data(), warmupInputs.data(), warmupInputs.size(),
+        outputNamePtrs.data(), outputNamePtrs.size());
+      if(logger != NULL)
+        logger->write(
+          "ONNX backend: OpenVINO warmup thread " + Global::intToString(serverThreadIdx) +
+          ": batch " + Global::intToString(batchSize) + "/" + Global::intToString(warmupMaxBatch) +
+          " compiled in " + Global::strprintf("%.1f", timer.getSeconds()) + " s");
+    }
   }
 
   ComputeHandle() = delete;
@@ -720,8 +816,8 @@ ComputeHandle* NeuralNet::createComputeHandle(
   int serverThreadIdx
 ) {
   // ONNX Runtime sessions support dynamic batch sizes, but the InputBuffers maxBatchSize
-  // field still enforces the upper bound at inference time.
-  (void)maxBatchSize;
+  // field still enforces the upper bound at inference time. It also caps the OpenVINO
+  // batch-size precompilation warmup (see ComputeHandle::warmupOpenVINO).
   if(inputsUseNHWC)
     throw StringError("ONNX backend: inputsUseNHWC = true not supported, must use NCHW");
 
@@ -741,7 +837,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
                   ": provider=" + context->providerName + " deviceIdx=" + deviceInfo);
   }
 
-  return new ComputeHandle(context, *loadedModel, logger, gpuIdxForThisThread, serverThreadIdx, requireExactNNLen);
+  return new ComputeHandle(context, *loadedModel, logger, maxBatchSize, gpuIdxForThisThread, serverThreadIdx, requireExactNNLen);
 }
 
 void NeuralNet::freeComputeHandle(ComputeHandle* computeHandle) {
