@@ -997,88 +997,6 @@ void NeuralNet::getOutput(
   // provider copies to device internally and returns outputs in CPU memory.
   Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-  std::array<int64_t, 4> maskShape = {batchSize, 1, nnYLen, nnXLen};
-  Ort::Value maskTensor = Ort::Value::CreateTensor<float>(
-    memInfo, inputBuffers->maskInput.data(), inputBuffers->singleMaskElts * batchSize,
-    maskShape.data(), maskShape.size());
-
-  std::array<int64_t, 4> spatialShape = {batchSize, numSpatialFeatures, nnYLen, nnXLen};
-  Ort::Value spatialTensor = Ort::Value::CreateTensor<float>(
-    memInfo, inputBuffers->spatialInput.data(), inputBuffers->singleInputElts * batchSize,
-    spatialShape.data(), spatialShape.size());
-
-  std::array<int64_t, 4> globalShape = {batchSize, numGlobalFeatures, 1, 1};
-  Ort::Value globalTensor = Ort::Value::CreateTensor<float>(
-    memInfo, inputBuffers->globalInput.data(), inputBuffers->singleInputGlobalElts * batchSize,
-    globalShape.data(), globalShape.size());
-
-  Ort::Value metaTensor(nullptr);
-  std::array<int64_t, 4> metaShape;
-  if(numMetaFeatures > 0) {
-    metaShape = {batchSize, numMetaFeatures, 1, 1};
-    metaTensor = Ort::Value::CreateTensor<float>(
-      memInfo, inputBuffers->metaInput.data(), inputBuffers->singleInputMetaElts * batchSize,
-      metaShape.data(), metaShape.size());
-  }
-
-  // Bind tensors in the graph's declared input order (ORT matches by pointer array + name array).
-  int maskIdx = findNameIndex(gpuHandle->inputNames, {"InputMask"});
-  int spatialIdx = findNameIndex(gpuHandle->inputNames, {"InputSpatial"});
-  int globalIdx = findNameIndex(gpuHandle->inputNames, {"InputGlobal"});
-  if(maskIdx < 0 || spatialIdx < 0 || globalIdx < 0)
-    throw StringError("ONNX backend: graph is missing expected inputs InputMask/InputSpatial/InputGlobal");
-  int metaIdx = -1;
-  if(numMetaFeatures > 0) {
-    metaIdx = findNameIndex(gpuHandle->inputNames, {"InputMeta"});
-    if(metaIdx < 0)
-      throw StringError("ONNX backend: model has metadata channels but the graph has no InputMeta input");
-  }
-
-  vector<Ort::Value> inputTensors;
-  inputTensors.reserve(gpuHandle->inputNames.size());
-  for(size_t i = 0; i < gpuHandle->inputNames.size(); i++) {
-    if((int)i == maskIdx)
-      inputTensors.push_back(std::move(maskTensor));
-    else if((int)i == spatialIdx)
-      inputTensors.push_back(std::move(spatialTensor));
-    else if((int)i == globalIdx)
-      inputTensors.push_back(std::move(globalTensor));
-    else if((int)i == metaIdx)
-      inputTensors.push_back(std::move(metaTensor));
-    else
-      throw StringError("ONNX backend: unexpected graph input '" + gpuHandle->inputNames[i] +
-                        "' -- only InputMask/InputSpatial/InputGlobal/InputMeta are supported");
-  }
-
-  auto outputTensors = gpuHandle->session->Run(
-    Ort::RunOptions{nullptr},
-    gpuHandle->inputNamePtrs.data(),
-    inputTensors.data(),
-    inputTensors.size(),
-    gpuHandle->outputNamePtrs.data(),
-    gpuHandle->outputNamePtrs.size());
-
-  int policyPassIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicyPass"});
-  int policyIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicy"});
-  int valueIdx = findNameIndex(gpuHandle->outputNames, {"OutputValue"});
-  int scoreValueIdx = findNameIndex(gpuHandle->outputNames, {"OutputScoreValue"});
-  int ownershipIdx = findNameIndex(gpuHandle->outputNames, {"OutputOwnership"});
-  if(policyPassIdx < 0 || policyIdx < 0 || valueIdx < 0 || scoreValueIdx < 0 || ownershipIdx < 0)
-    throw StringError(
-      "ONNX backend: graph is missing expected outputs "
-      "(OutputPolicyPass/OutputPolicy/OutputValue/OutputScoreValue/OutputOwnership)");
-
-  const float* policyPassData = outputTensors[policyPassIdx].GetTensorData<float>();
-  const float* policyData = outputTensors[policyIdx].GetTensorData<float>();
-  const float* valueData = outputTensors[valueIdx].GetTensorData<float>();
-  const float* scoreValueData = outputTensors[scoreValueIdx].GetTensorData<float>();
-  const float* ownershipData = outputTensors[ownershipIdx].GetTensorData<float>();
-
-  assert(policyPassData != nullptr);
-  assert(policyData != nullptr);
-  assert(valueData != nullptr);
-  assert(scoreValueData != nullptr);
-  assert(ownershipData != nullptr);
   assert((int)outputs.size() == batchSize);
 
   const int numPolicyChannels = (int)inputBuffers->singlePolicyPassResultElts;
@@ -1086,100 +1004,204 @@ void NeuralNet::getOutput(
   const int numValueChannels = (int)inputBuffers->singleValueResultElts;
   const int numScoreValueChannels = (int)inputBuffers->singleScoreValueResultElts;
 
-  // Per-row decode, reproducing the TensorRT backend's post-processing exactly.
-  // Outputs are raw logits, so the client applies softmax / tanh / etc.
-  float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
+  // Assemble the input tensors for runBatchSize rows starting at rowOffset, run the session,
+  // and decode the outputs into outputs[rowOffset..rowOffset+runBatchSize).
+  auto runAndDecode = [&](int runBatchSize, int rowOffset) {
+    std::array<int64_t, 4> maskShape = {runBatchSize, 1, nnYLen, nnXLen};
+    Ort::Value maskTensor = Ort::Value::CreateTensor<float>(
+      memInfo, inputBuffers->maskInput.data() + inputBuffers->singleMaskElts * rowOffset,
+      inputBuffers->singleMaskElts * runBatchSize,
+      maskShape.data(), maskShape.size());
 
-  for(int row = 0; row < batchSize; row++) {
-    NNOutput* output = outputs[row];
-    assert(output->nnXLen == nnXLen);
-    assert(output->nnYLen == nnYLen);
-    float policyOptimism = (float)inputBufs[row]->policyOptimism;
+    std::array<int64_t, 4> spatialShape = {runBatchSize, numSpatialFeatures, nnYLen, nnXLen};
+    Ort::Value spatialTensor = Ort::Value::CreateTensor<float>(
+      memInfo, inputBuffers->spatialInput.data() + inputBuffers->singleInputElts * rowOffset,
+      inputBuffers->singleInputElts * runBatchSize,
+      spatialShape.data(), spatialShape.size());
 
-    // Policy: OutputPolicyPass is [N, numPolicyChannels, 1, 1] and OutputPolicy is [N, numPolicyChannels, H, W].
-    {
-      const float* policyPassSrcBuf = policyPassData + row * numPolicyChannels;
-      const float* policySrcBuf = policyData + row * numPolicyChannels * nnXLen * nnYLen;
-      float* policyProbs = output->policyProbs;
+    std::array<int64_t, 4> globalShape = {runBatchSize, numGlobalFeatures, 1, 1};
+    Ort::Value globalTensor = Ort::Value::CreateTensor<float>(
+      memInfo, inputBuffers->globalInput.data() + inputBuffers->singleInputGlobalElts * rowOffset,
+      inputBuffers->singleInputGlobalElts * runBatchSize,
+      globalShape.data(), globalShape.size());
 
-      if(numPolicyChannels == 2 || (numPolicyChannels == 4 && modelVersion >= 16)) {
-        // NCHW: channel 0 = base logits, channel 1 = optimism logits.
-        for(int i = 0; i < nnXLen * nnYLen; i++) {
-          float p = policySrcBuf[i];
-          float pOpt = policySrcBuf[i + nnXLen * nnYLen];
-          policyProbsTmp[i] = p + (pOpt - p) * policyOptimism;
+    Ort::Value metaTensor(nullptr);
+    std::array<int64_t, 4> metaShape;
+    if(numMetaFeatures > 0) {
+      metaShape = {runBatchSize, numMetaFeatures, 1, 1};
+      metaTensor = Ort::Value::CreateTensor<float>(
+        memInfo, inputBuffers->metaInput.data() + inputBuffers->singleInputMetaElts * rowOffset,
+        inputBuffers->singleInputMetaElts * runBatchSize,
+        metaShape.data(), metaShape.size());
+    }
+
+    // Bind tensors in the graph's declared input order (ORT matches by pointer array + name array).
+    int maskIdx = findNameIndex(gpuHandle->inputNames, {"InputMask"});
+    int spatialIdx = findNameIndex(gpuHandle->inputNames, {"InputSpatial"});
+    int globalIdx = findNameIndex(gpuHandle->inputNames, {"InputGlobal"});
+    if(maskIdx < 0 || spatialIdx < 0 || globalIdx < 0)
+      throw StringError("ONNX backend: graph is missing expected inputs InputMask/InputSpatial/InputGlobal");
+    int metaIdx = -1;
+    if(numMetaFeatures > 0) {
+      metaIdx = findNameIndex(gpuHandle->inputNames, {"InputMeta"});
+      if(metaIdx < 0)
+        throw StringError("ONNX backend: model has metadata channels but the graph has no InputMeta input");
+    }
+
+    vector<Ort::Value> inputTensors;
+    inputTensors.reserve(gpuHandle->inputNames.size());
+    for(size_t i = 0; i < gpuHandle->inputNames.size(); i++) {
+      if((int)i == maskIdx)
+        inputTensors.push_back(std::move(maskTensor));
+      else if((int)i == spatialIdx)
+        inputTensors.push_back(std::move(spatialTensor));
+      else if((int)i == globalIdx)
+        inputTensors.push_back(std::move(globalTensor));
+      else if((int)i == metaIdx)
+        inputTensors.push_back(std::move(metaTensor));
+      else
+        throw StringError("ONNX backend: unexpected graph input '" + gpuHandle->inputNames[i] +
+                          "' -- only InputMask/InputSpatial/InputGlobal/InputMeta are supported");
+    }
+
+    auto outputTensors = gpuHandle->session->Run(
+      Ort::RunOptions{nullptr},
+      gpuHandle->inputNamePtrs.data(),
+      inputTensors.data(),
+      inputTensors.size(),
+      gpuHandle->outputNamePtrs.data(),
+      gpuHandle->outputNamePtrs.size());
+
+    int policyPassIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicyPass"});
+    int policyIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicy"});
+    int valueIdx = findNameIndex(gpuHandle->outputNames, {"OutputValue"});
+    int scoreValueIdx = findNameIndex(gpuHandle->outputNames, {"OutputScoreValue"});
+    int ownershipIdx = findNameIndex(gpuHandle->outputNames, {"OutputOwnership"});
+    if(policyPassIdx < 0 || policyIdx < 0 || valueIdx < 0 || scoreValueIdx < 0 || ownershipIdx < 0)
+      throw StringError(
+        "ONNX backend: graph is missing expected outputs "
+        "(OutputPolicyPass/OutputPolicy/OutputValue/OutputScoreValue/OutputOwnership)");
+
+    const float* policyPassData = outputTensors[policyPassIdx].GetTensorData<float>();
+    const float* policyData = outputTensors[policyIdx].GetTensorData<float>();
+    const float* valueData = outputTensors[valueIdx].GetTensorData<float>();
+    const float* scoreValueData = outputTensors[scoreValueIdx].GetTensorData<float>();
+    const float* ownershipData = outputTensors[ownershipIdx].GetTensorData<float>();
+
+    assert(policyPassData != nullptr);
+    assert(policyData != nullptr);
+    assert(valueData != nullptr);
+    assert(scoreValueData != nullptr);
+    assert(ownershipData != nullptr);
+
+    // Per-row decode, reproducing the TensorRT backend's post-processing exactly.
+    // Outputs are raw logits, so the client applies softmax / tanh / etc.
+    float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
+
+    for(int r = 0; r < runBatchSize; r++) {
+      const int row = rowOffset + r;
+      NNOutput* output = outputs[row];
+      assert(output->nnXLen == nnXLen);
+      assert(output->nnYLen == nnYLen);
+      float policyOptimism = (float)inputBufs[row]->policyOptimism;
+
+      // Policy: OutputPolicyPass is [N, numPolicyChannels, 1, 1] and OutputPolicy is [N, numPolicyChannels, H, W].
+      {
+        const float* policyPassSrcBuf = policyPassData + r * numPolicyChannels;
+        const float* policySrcBuf = policyData + r * numPolicyChannels * nnXLen * nnYLen;
+        float* policyProbs = output->policyProbs;
+
+        if(numPolicyChannels == 2 || (numPolicyChannels == 4 && modelVersion >= 16)) {
+          // NCHW: channel 0 = base logits, channel 1 = optimism logits.
+          for(int i = 0; i < nnXLen * nnYLen; i++) {
+            float p = policySrcBuf[i];
+            float pOpt = policySrcBuf[i + nnXLen * nnYLen];
+            policyProbsTmp[i] = p + (pOpt - p) * policyOptimism;
+          }
+          SymmetryHelpers::copyOutputsWithSymmetry(
+            policyProbsTmp, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+          policyProbs[nnXLen * nnYLen] =
+            policyPassSrcBuf[0] + (policyPassSrcBuf[1] - policyPassSrcBuf[0]) * policyOptimism;
         }
+        else {
+          assert(numPolicyChannels == 1);
+          SymmetryHelpers::copyOutputsWithSymmetry(
+            policySrcBuf, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+          policyProbs[nnXLen * nnYLen] = policyPassSrcBuf[0];
+        }
+      }
+
+      // Value: [N, 3, 1, 1] raw categorical logits (win/loss/noresult).
+      {
+        assert(numValueChannels == 3);
+        output->whiteWinProb = valueData[r * numValueChannels];
+        output->whiteLossProb = valueData[r * numValueChannels + 1];
+        output->whiteNoResultProb = valueData[r * numValueChannels + 2];
+      }
+
+      // Ownership: [N, 1, H, W] raw, inverse-symmetried back to canonical orientation.
+      if(output->whiteOwnerMap != NULL) {
+        assert(inputBuffers->singleOwnershipResultElts == (size_t)nnXLen * nnYLen);
+        const float* ownershipSrcBuf = ownershipData + r * nnXLen * nnYLen;
         SymmetryHelpers::copyOutputsWithSymmetry(
-          policyProbsTmp, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
-        policyProbs[nnXLen * nnYLen] =
-          policyPassSrcBuf[0] + (policyPassSrcBuf[1] - policyPassSrcBuf[0]) * policyOptimism;
+          ownershipSrcBuf, output->whiteOwnerMap, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
       }
-      else {
-        assert(numPolicyChannels == 1);
-        SymmetryHelpers::copyOutputsWithSymmetry(
-          policySrcBuf, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
-        policyProbs[nnXLen * nnYLen] = policyPassSrcBuf[0];
-      }
-    }
 
-    // Value: [N, 3, 1, 1] raw categorical logits (win/loss/noresult).
-    {
-      assert(numValueChannels == 3);
-      output->whiteWinProb = valueData[row * numValueChannels];
-      output->whiteLossProb = valueData[row * numValueChannels + 1];
-      output->whiteNoResultProb = valueData[row * numValueChannels + 2];
+      // ScoreValue: [N, numScoreValueChannels, 1, 1] raw, version-dependent channel interpretation.
+      {
+        if(modelVersion >= 9) {
+          assert(numScoreValueChannels == 6);
+          output->whiteScoreMean = scoreValueData[r * numScoreValueChannels];
+          output->whiteScoreMeanSq = scoreValueData[r * numScoreValueChannels + 1];
+          output->whiteLead = scoreValueData[r * numScoreValueChannels + 2];
+          output->varTimeLeft = scoreValueData[r * numScoreValueChannels + 3];
+          output->shorttermWinlossError = scoreValueData[r * numScoreValueChannels + 4];
+          output->shorttermScoreError = scoreValueData[r * numScoreValueChannels + 5];
+        }
+        else if(modelVersion >= 8) {
+          assert(numScoreValueChannels == 4);
+          output->whiteScoreMean = scoreValueData[r * numScoreValueChannels];
+          output->whiteScoreMeanSq = scoreValueData[r * numScoreValueChannels + 1];
+          output->whiteLead = scoreValueData[r * numScoreValueChannels + 2];
+          output->varTimeLeft = scoreValueData[r * numScoreValueChannels + 3];
+          output->shorttermWinlossError = 0;
+          output->shorttermScoreError = 0;
+        }
+        else if(modelVersion >= 4) {
+          assert(numScoreValueChannels == 2);
+          output->whiteScoreMean = scoreValueData[r * numScoreValueChannels];
+          output->whiteScoreMeanSq = scoreValueData[r * numScoreValueChannels + 1];
+          output->whiteLead = output->whiteScoreMean;
+          output->varTimeLeft = 0;
+          output->shorttermWinlossError = 0;
+          output->shorttermScoreError = 0;
+        }
+        else if(modelVersion >= 3) {
+          assert(numScoreValueChannels == 1);
+          output->whiteScoreMean = scoreValueData[r * numScoreValueChannels];
+          output->whiteScoreMeanSq = output->whiteScoreMean * output->whiteScoreMean;
+          output->whiteLead = output->whiteScoreMean;
+          output->varTimeLeft = 0;
+          output->shorttermWinlossError = 0;
+          output->shorttermScoreError = 0;
+        }
+        else {
+          ASSERT_UNREACHABLE;
+        }
+      }
     }
+  };
 
-    // Ownership: [N, 1, H, W] raw, inverse-symmetried back to canonical orientation.
-    if(output->whiteOwnerMap != NULL) {
-      assert(inputBuffers->singleOwnershipResultElts == (size_t)nnXLen * nnYLen);
-      const float* ownershipSrcBuf = ownershipData + row * nnXLen * nnYLen;
-      SymmetryHelpers::copyOutputsWithSymmetry(
-        ownershipSrcBuf, output->whiteOwnerMap, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
-    }
-
-    // ScoreValue: [N, numScoreValueChannels, 1, 1] raw, version-dependent channel interpretation.
-    {
-      if(modelVersion >= 9) {
-        assert(numScoreValueChannels == 6);
-        output->whiteScoreMean = scoreValueData[row * numScoreValueChannels];
-        output->whiteScoreMeanSq = scoreValueData[row * numScoreValueChannels + 1];
-        output->whiteLead = scoreValueData[row * numScoreValueChannels + 2];
-        output->varTimeLeft = scoreValueData[row * numScoreValueChannels + 3];
-        output->shorttermWinlossError = scoreValueData[row * numScoreValueChannels + 4];
-        output->shorttermScoreError = scoreValueData[row * numScoreValueChannels + 5];
-      }
-      else if(modelVersion >= 8) {
-        assert(numScoreValueChannels == 4);
-        output->whiteScoreMean = scoreValueData[row * numScoreValueChannels];
-        output->whiteScoreMeanSq = scoreValueData[row * numScoreValueChannels + 1];
-        output->whiteLead = scoreValueData[row * numScoreValueChannels + 2];
-        output->varTimeLeft = scoreValueData[row * numScoreValueChannels + 3];
-        output->shorttermWinlossError = 0;
-        output->shorttermScoreError = 0;
-      }
-      else if(modelVersion >= 4) {
-        assert(numScoreValueChannels == 2);
-        output->whiteScoreMean = scoreValueData[row * numScoreValueChannels];
-        output->whiteScoreMeanSq = scoreValueData[row * numScoreValueChannels + 1];
-        output->whiteLead = output->whiteScoreMean;
-        output->varTimeLeft = 0;
-        output->shorttermWinlossError = 0;
-        output->shorttermScoreError = 0;
-      }
-      else if(modelVersion >= 3) {
-        assert(numScoreValueChannels == 1);
-        output->whiteScoreMean = scoreValueData[row * numScoreValueChannels];
-        output->whiteScoreMeanSq = output->whiteScoreMean * output->whiteScoreMean;
-        output->whiteLead = output->whiteScoreMean;
-        output->varTimeLeft = 0;
-        output->shorttermWinlossError = 0;
-        output->shorttermScoreError = 0;
-      }
-      else {
-        ASSERT_UNREACHABLE;
-      }
-    }
+  // The OpenVINO EP on the NPU compiles one static graph per batch size, so a batch above 1
+  // would trigger a whole-graph recompile taking tens of seconds the first time it occurs.
+  // The NPU is a single-stream device anyway, so running one row per forward costs nothing
+  // there and keeps the batch size at 1 forever. Other devices run the whole batch at once.
+  if(gpuHandle->isNpu && batchSize > 1) {
+    for(int row = 0; row < batchSize; row++)
+      runAndDecode(1, row);
+  }
+  else {
+    runAndDecode(batchSize, 0);
   }
 }
 
