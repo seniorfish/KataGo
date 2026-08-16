@@ -1896,7 +1896,13 @@ if(MSVC)
     target_compile_definitions(katago PRIVATE USE_AVX2)
   endif()
 
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")
+  # The OpenVINO NPU plugin compiles the whole model on the calling thread at the first
+  # forward, and the vpux compiler for Lunar Lake (NPU4) needs well over 8 MB of stack
+  # for large models like b40 (768 channels): it dies with 0xC00000FD stack overflow
+  # inside _chkstk / openvino_intel_npu_compiler.dll. 256 MB is a generous reserve that
+  # costs no committed memory until the stack is actually used (Windows grows it on
+  # demand), and the reserve is virtual address space only, which is abundant on x64.
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:268435456")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   message(STATUS "Setting up build for GNU, Clang or MinGW.")
   if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "(arm|aarch32|aarch64)")
@@ -1954,9 +1960,10 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
       # libatomic is a Linux GCC/Clang runtime, not needed or available on Windows
       target_link_libraries(katago "atomic")
     else()
-      # Match the 8 MB stack every MSVC-built KataGo requests in the if(MSVC) branch above.
-      # Without this a Windows clang/lld-link build gets the 1 MB default.
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,/STACK:8388608")
+      # Match the 256 MB stack every MSVC-built KataGo requests in the if(MSVC) branch
+      # above (the NPU graph compile needs it - see the comment there). Without this a
+      # Windows clang/lld-link build gets the 1 MB default.
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,/STACK:268435456")
     endif()
   endif()
 
