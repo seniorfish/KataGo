@@ -155,6 +155,11 @@ struct ComputeContext {
   bool transformerNHWC;         // run the trunk block stack channel-last (NHWC)
   bool skipScale8;              // skip the scale8 FP16-range workaround (see createComputeContext)
 
+  // Batch the ONNX graph is emitted with: 0 = keep the symbolic (dynamic) batch dimension, -1 =
+  // auto (1 on the NPU, symbolic elsewhere), >0 = fix the batch to this value. On the OpenVINO NPU
+  // the graph must be statically shaped to compile at all (see BuildParams::staticBatchSize).
+  int openvinoStaticBatchSize;
+
   // Per-thread device type (index = serverThreadIdx). Filled with openvinoDeviceType
   // by default, and individual entries are replaced by onnxOpenVINODeviceTypeThread<N>.
   std::vector<std::string> perThreadDeviceType;
@@ -169,7 +174,8 @@ struct ComputeContext {
       openvinoPrecision(""),
       openvinoNumStreams(""),
       transformerNHWC(true),
-      skipScale8(false)
+      skipScale8(false),
+      openvinoStaticBatchSize(-1)
   {}
 };
 
@@ -210,6 +216,11 @@ ComputeContext* NeuralNet::createComputeContext(
   ctx->openvinoCacheDir = cfg.contains("onnxOpenVINOCacheDir") ? cfg.getString("onnxOpenVINOCacheDir") : "";
   ctx->openvinoPrecision = cfg.contains("onnxOpenVINOPrecision") ? cfg.getString("onnxOpenVINOPrecision") : "";
   ctx->openvinoNumStreams = cfg.contains("onnxOpenVINONumStreams") ? cfg.getString("onnxOpenVINONumStreams") : "";
+
+  // -1 (default) = auto: fix the batch to 1 on the NPU, keep the symbolic batch elsewhere. 0 =
+  // keep the symbolic (dynamic) batch everywhere (the old behavior). N > 0 = fix the batch to N.
+  ctx->openvinoStaticBatchSize =
+    cfg.contains("onnxOpenVINOStaticBatchSize") ? cfg.getInt("onnxOpenVINOStaticBatchSize", 0, 1024) : -1;
 
   // useFP16 = false is an explicit request for full FP32 on every other backend. The only
   // provider here that downcasts an fp32 graph by default is OpenVINO (GPU/NPU run FP16
@@ -390,6 +401,23 @@ struct ComputeHandle {
     // FP32 node-name lists are ignored, since ORT has no per-node precision API.
     OnnxModelBuilder::Result onnxResult;   // only filled on the emit path
     const string* onnxBytesPtr = NULL;
+
+    // The OpenVINO NPU compiler cannot handle an unbounded dynamic batch on a large model (it dies
+    // with a stack overflow or hangs; see BuildParams::staticBatchSize). When a thread targets the
+    // NPU we emit the graph with a fixed batch of 1 unless the user pinned a different value. GPU
+    // and CPU keep the symbolic batch, which they handle fine.
+    string openvinoThreadDeviceType;
+    int staticBatchSize = 0;
+    if(ctx->providerName == "openvino") {
+      openvinoThreadDeviceType = ctx->openvinoDeviceType;
+      if(serverThreadIdx >= 0 && serverThreadIdx < (int)ctx->perThreadDeviceType.size())
+        openvinoThreadDeviceType = ctx->perThreadDeviceType[serverThreadIdx];
+      if(ctx->openvinoStaticBatchSize >= 0)
+        staticBatchSize = ctx->openvinoStaticBatchSize;
+      else
+        staticBatchSize = openvinoThreadDeviceType.find("NPU") != string::npos ? 1 : 0;
+    }
+
     if(loadedModel.isExternalOnnx) {
       OnnxModelBuilder::checkRuntimeParams(
         loadedModel.externalOnnx, loadedModel.modelFileName, ctx->nnXLen, ctx->nnYLen, requireExactNNLen);
@@ -413,9 +441,20 @@ struct ComputeHandle {
             "OpenVINO execution provider binds the inputs after it to the wrong buffers and fails "
             "with a shape mismatch. Unconsumed inputs must be declared last.");
       }
-      // Read straight out of the LoadedModel, which outlives every compute handle - no need for a
-      // per-thread copy of what can be hundreds of MB.
-      onnxBytesPtr = &loadedModel.externalOnnx.serializedModel;
+      if(staticBatchSize > 0) {
+        // Patch the symbolic batch in memory; the on-disk .onnx stays untouched. This copies the
+        // model once (hundreds of MB for large nets), which is only worth it on the NPU.
+        if(logger != NULL)
+          logger->write("ONNX backend: fixing batch size to " + Global::intToString(staticBatchSize) +
+                        " for OpenVINO device " + openvinoThreadDeviceType);
+        onnxResult.serializedModel =
+          OnnxModelBuilder::staticizeSymbolicBatch(loadedModel.externalOnnx.serializedModel, staticBatchSize);
+        onnxBytesPtr = &onnxResult.serializedModel;
+      } else {
+        // Read straight out of the LoadedModel, which outlives every compute handle - no need for a
+        // per-thread copy of what can be hundreds of MB.
+        onnxBytesPtr = &loadedModel.externalOnnx.serializedModel;
+      }
     }
     else {
       if(logger != NULL)
@@ -430,7 +469,12 @@ struct ComputeHandle {
       buildParams.requireExactNNLen = requireExactNNLen;
       buildParams.transformerNHWC = ctx->transformerNHWC;
       buildParams.scale8Applied = loadedModel.scale8Applied;
+      buildParams.staticBatchSize = staticBatchSize;
       onnxResult = OnnxModelBuilder::build(loadedModel.modelDesc, buildParams, logger);
+      if(staticBatchSize > 0 && logger != NULL)
+        logger->write("ONNX backend: graph emitted with fixed batch size " +
+                      Global::intToString(staticBatchSize) + " for OpenVINO device " +
+                      openvinoThreadDeviceType);
       onnxBytesPtr = &onnxResult.serializedModel;
     }
     const string& onnxBytes = *onnxBytesPtr;

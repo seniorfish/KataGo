@@ -56,6 +56,8 @@ Below, `X` and `Y` are the board buffer width and height declared in the metadat
 
 All tensors are float32 and NCHW, with a dynamic (symbolic) batch dimension and fixed C, H and W. Graph inputs or outputs beyond these are rejected, since KataGo has nothing to bind to them.
 
+KataGo's own emitter writes the symbolic batch by default. One exception: the OpenVINO backend may emit (or rewrite) a graph with the batch fixed to a static value when targeting the NPU, via `onnxOpenVINOStaticBatchSize` (see `configs/gtp_example.cfg`). The NPU compiler cannot plan memory and kernels for an unbounded dynamic batch on a large model, and crashes with a stack overflow or hangs. A graph with a fixed batch still runs - the backend just requires every inference to use exactly that batch size.
+
 | Input | Shape | Contents |
 |---|---|---|
 | `InputSpatial` | `[N, numInputChannels, Y, X]` | Per-point features for the model version, as computed by `NNInputs::fillRowV*` in `cpp/neuralnet/nninputs.cpp`. |

@@ -985,7 +985,8 @@ BuildParams::BuildParams()
     nnYLen(0),
     requireExactNNLen(false),
     transformerNHWC(false),
-    scale8Applied(false)
+    scale8Applied(false),
+    staticBatchSize(0)
 {}
 
 LoadResult::LoadResult()
@@ -997,6 +998,31 @@ LoadResult::LoadResult()
     rmsNormNodeNames(),
     danglingInputNotDeclaredLast(false)
 {}
+
+// See the declaration in onnxmodelbuilder.h.
+std::string staticizeSymbolicBatch(const std::string& onnxBytes, int batchSize) {
+  onnx::ModelProto model;
+  if(!model.ParseFromArray(onnxBytes.data(), (int)onnxBytes.size()))
+    throw StringError("OnnxModelBuilder::staticizeSymbolicBatch: could not parse ONNX model bytes");
+  onnx::GraphProto* graph = model.mutable_graph();
+  auto patchValueInfo = [&](onnx::ValueInfoProto* vi) {
+    onnx::TensorShapeProto* shape = vi->mutable_type()->mutable_tensor_type()->mutable_shape();
+    for(int i = 0; i < shape->dim_size(); i++) {
+      onnx::TensorShapeProto::Dimension* d = shape->mutable_dim(i);
+      if(d->has_dim_param() && d->dim_param() == "batch") {
+        d->clear_dim_param();
+        d->set_dim_value(batchSize);
+      }
+    }
+  };
+  for(int i = 0; i < graph->input_size(); i++)
+    patchValueInfo(graph->mutable_input(i));
+  for(int i = 0; i < graph->output_size(); i++)
+    patchValueInfo(graph->mutable_output(i));
+  // The declared graph IO is the only place KataGo emits the symbolic dim, and shape inference fills
+  // the interior from there, so patching the IO is sufficient to make the whole graph static.
+  return model.SerializeAsString();
+}
 
 Result build(
   const ModelDesc& desc,
@@ -1010,6 +1036,8 @@ Result build(
   // NHWC region, so the flag means nothing there. Doing it here rather than ignoring it downstream
   // keeps the recorded value accurate, which matters because TensorRT keys its caches on it.
   const bool transformerNHWC = buildParams.transformerNHWC && desc.hasAnyTransformerBlocks();
+  // >0: emit a fixed batch dimension instead of the symbolic "batch" dim_param (see BuildParams).
+  const int staticBatchSize = buildParams.staticBatchSize;
 
   if(logger != NULL)
     logger->write("Building internal onnx model, requireExactNNLen=" + Global::boolToString(requireExactNNLen) + " transformerNHWC=" + Global::boolToString(transformerNHWC));
@@ -1083,7 +1111,10 @@ Result build(
     onnx::TypeProto::Tensor* t = vi->mutable_type()->mutable_tensor_type();
     t->set_elem_type(onnx::TensorProto::FLOAT);
     onnx::TensorShapeProto* shape = t->mutable_shape();
-    shape->add_dim()->set_dim_param("batch");
+    if(staticBatchSize > 0)
+      shape->add_dim()->set_dim_value(staticBatchSize);
+    else
+      shape->add_dim()->set_dim_param("batch");
     shape->add_dim()->set_dim_value(channels);
     shape->add_dim()->set_dim_value(nnYLen);
     shape->add_dim()->set_dim_value(nnXLen);
@@ -1094,7 +1125,10 @@ Result build(
     onnx::TypeProto::Tensor* t = vi->mutable_type()->mutable_tensor_type();
     t->set_elem_type(onnx::TensorProto::FLOAT);
     onnx::TensorShapeProto* shape = t->mutable_shape();
-    shape->add_dim()->set_dim_param("batch");
+    if(staticBatchSize > 0)
+      shape->add_dim()->set_dim_value(staticBatchSize);
+    else
+      shape->add_dim()->set_dim_param("batch");
     shape->add_dim()->set_dim_value(channels);
     shape->add_dim()->set_dim_value(1);
     shape->add_dim()->set_dim_value(1);
@@ -1260,7 +1294,10 @@ Result build(
       onnx::TypeProto::Tensor* t = vi->mutable_type()->mutable_tensor_type();
       t->set_elem_type(onnx::TensorProto::FLOAT);
       onnx::TensorShapeProto* shape = t->mutable_shape();
-      shape->add_dim()->set_dim_param("batch");
+      if(staticBatchSize > 0)
+        shape->add_dim()->set_dim_value(staticBatchSize);
+      else
+        shape->add_dim()->set_dim_param("batch");
       shape->add_dim()->set_dim_value(channels);
       shape->add_dim()->set_dim_value(spatial ? nnYLen : 1);
       shape->add_dim()->set_dim_value(spatial ? nnXLen : 1);
@@ -1297,7 +1334,10 @@ Result build(
       onnx::TypeProto::Tensor* t = vi->mutable_type()->mutable_tensor_type();
       t->set_elem_type(onnx::TensorProto::FLOAT);
       onnx::TensorShapeProto* shape = t->mutable_shape();
-      shape->add_dim()->set_dim_param("batch");
+      if(staticBatchSize > 0)
+        shape->add_dim()->set_dim_value(staticBatchSize);
+      else
+        shape->add_dim()->set_dim_param("batch");
       shape->add_dim()->set_dim_value(channels);
       shape->add_dim()->set_dim_value(spatial ? nnYLen : 1);
       shape->add_dim()->set_dim_value(spatial ? nnXLen : 1);

@@ -37,6 +37,14 @@ namespace OnnxModelBuilder {
     // The compensation for it lives in postProcessParams.outputScaleMultiplier, which is recorded
     // already transformed, so this is only reported, never re-applied.
     bool scale8Applied;
+    // If > 0, declare every graph input/output batch dimension as this fixed value instead of the
+    // symbolic dim_param "batch". The symbolic batch lets one session run any batch size, but the
+    // OpenVINO NPU compiler rejects an unbounded dynamic batch for large models: it must plan NPU
+    // memory and kernels at compile time, and against a [?, C, H, W] input it takes a runaway path
+    // that dies with a stack overflow (0xC00000FD) or hangs for a model as large as b40. Fixing the
+    // batch makes the whole graph statically shaped, which the NPU compiles fine. Set it to the
+    // batch size the caller actually runs (usually 1); 0 keeps the dynamic (symbolic) batch.
+    int staticBatchSize;
 
     BuildParams();
   };
@@ -62,6 +70,14 @@ namespace OnnxModelBuilder {
     const BuildParams& buildParams,
     Logger* logger
   );
+
+  // Rewrite a serialized ONNX ModelProto's symbolic batch dimension (the dim_param "batch" on every
+  // graph input and output) to the fixed dim_value given, returning the new bytes. The rest of the
+  // graph follows via shape inference, so the result is fully statically shaped. This is how an
+  // external .onnx file is made NPU-compilable without editing the file (see BuildParams::staticBatchSize
+  // for why an unbounded dynamic batch is a problem for the OpenVINO NPU compiler).
+  // Throws StringError if the bytes do not parse as an ONNX ModelProto.
+  std::string staticizeSymbolicBatch(const std::string& onnxBytes, int batchSize);
 
   // ---- Reading a .onnx model file ----
 
